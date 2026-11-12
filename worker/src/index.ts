@@ -5,6 +5,18 @@ export interface Env {
 }
 
 /**
+ * Constant-time string comparison to prevent timing attacks on secrets.
+ */
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) {
+    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
+/**
  * Triggers the GitHub Action workflow via the GitHub repository_dispatch API.
  * Uses only 1 subrequest and completes in ~200ms.
  */
@@ -64,24 +76,91 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    // Endpoint: POST /trigger or GET /trigger?token=...
+    // Endpoint: /trigger
     if (url.pathname === "/trigger") {
-      if (env.TRIGGER_SECRET) {
-        const token = url.searchParams.get("token") || request.headers.get("x-trigger-secret");
-        if (token !== env.TRIGGER_SECRET) {
-          return Response.json({ error: "Unauthorized: Invalid or missing trigger secret." }, { status: 401 });
-        }
+      // Handle CORS preflight
+      if (request.method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Headers": "x-trigger-secret, Authorization, Content-Type",
+          },
+        });
+      }
+
+      // Restrict allowed HTTP methods
+      if (request.method !== "POST" && request.method !== "GET") {
+        return Response.json(
+          { error: "Method not allowed. Use POST or GET." },
+          {
+            status: 405,
+            headers: {
+              Allow: "POST, GET, OPTIONS",
+              "Access-Control-Allow-Origin": "*",
+            },
+          }
+        );
+      }
+
+      // 1. Fail closed: Reject if TRIGGER_SECRET is not configured on the worker
+      if (!env.TRIGGER_SECRET) {
+        return Response.json(
+          { error: "Forbidden: Manual trigger is disabled because TRIGGER_SECRET is not configured." },
+          {
+            status: 403,
+            headers: {
+              "Access-Control-Allow-Origin": "*",
+            },
+          }
+        );
+      }
+
+      // 2. Extract token from header (x-trigger-secret / Authorization: Bearer <token>) or query parameter
+      const authHeader = request.headers.get("authorization");
+      const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+      const token =
+        request.headers.get("x-trigger-secret") ||
+        bearerToken ||
+        url.searchParams.get("token");
+
+      if (!token || !timingSafeEqual(token, env.TRIGGER_SECRET)) {
+        return Response.json(
+          { error: "Unauthorized: Invalid or missing trigger secret." },
+          {
+            status: 401,
+            headers: {
+              "Access-Control-Allow-Origin": "*",
+            },
+          }
+        );
       }
 
       try {
         const result = await triggerGitHubWorkflow(env, "manual-http-trigger");
-        return Response.json({
-          message: "GitHub Action successfully triggered via repository_dispatch!",
-          targetRepository: env.GITHUB_REPO || "Szitku/loid-vosfor-exchange",
-          timestamp: result.timestamp,
-        });
+        return Response.json(
+          {
+            message: "GitHub Action successfully triggered via repository_dispatch!",
+            targetRepository: env.GITHUB_REPO || "Szitku/loid-vosfor-exchange",
+            timestamp: result.timestamp,
+          },
+          {
+            headers: {
+              "Access-Control-Allow-Origin": "*",
+            },
+          }
+        );
       } catch (err: any) {
-        return Response.json({ error: "Failed to dispatch workflow", details: err?.message }, { status: 500 });
+        return Response.json(
+          { error: "Failed to dispatch workflow", details: err?.message },
+          {
+            status: 500,
+            headers: {
+              "Access-Control-Allow-Origin": "*",
+            },
+          }
+        );
       }
     }
 
@@ -94,7 +173,7 @@ export default {
         targetRepository: env.GITHUB_REPO || "Szitku/loid-vosfor-exchange",
         eventType: "update-market-data",
         endpoints: {
-          manualTrigger: "/trigger (POST or GET with optional ?token=...)",
+          manualTrigger: "/trigger (POST with x-trigger-secret header or ?token=...)",
         },
       },
       {
